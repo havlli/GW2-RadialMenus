@@ -99,6 +99,7 @@ void CRadialMenu::Save()
 		{"Scale", this->Scale},
 		{"IconScale", this->IconScale},
 		{"ItemRotation", this->ItemRotationDegrees},
+		{"ArcSpanDegrees", this->ArcSpanDegrees},
 		{"ShowItemNameTooltip", this->ShowItemNameTooltip},
 
 		{"Items", json::array()}
@@ -208,7 +209,7 @@ bool CRadialMenu::Render()
 	}
 
 	this->LoadSegmentTexture();
-	this->SegmentRadius = 360.0f / this->DrawnItems.size();
+	this->SegmentRadius = (float)this->ArcSpanDegrees / this->DrawnItems.size();
 
 	if (this->DrawnItems.size() <= 0) { return false; }
 	if (this->DrawnItems.size() == 1) { RadialCtx->Release(ESelectionMode::SingleItem); return false; }

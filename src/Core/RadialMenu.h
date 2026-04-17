@@ -40,6 +40,9 @@ class CRadialMenu
 	bool                        ShowItemNameTooltip;
 	std::string                 SpecificCenterItemName;
 
+	/* ported from GW2Radial: partial-arc layout; 360 = full circle (default) */
+	int                         ArcSpanDegrees      = 360;
+
 	/* runtime render values */
 	float                       RenderOpacity;
 

@@ -1210,6 +1210,14 @@ void CRadialContext::RenderEditorTab()
 				HasChanges = true;
 			}
 
+			ImGui::TextDisabled("Arc Span (degrees)");
+			ImGui::HelpMarker("Total angular arc across which items are distributed.\n360 = full circle (default, unchanged behavior). Lower values cluster items into a partial pie.\nNote: hover hit-testing still wraps the full circle; hovering outside the arc snaps to the nearest item.");
+			ImGui::SetNextItemWidth(ImGui::CalcItemWidth() / 2);
+			if (ImGui::SliderInt("##radialarcspan", &this->EditingMenu->ArcSpanDegrees, 60, 360))
+			{
+				HasChanges = true;
+			}
+
 			ImGui::Checkbox("Draw in Center", &this->EditingMenu->DrawInCenter);
 			if (this->EditingMenu->DrawInCenter)
 			{
@@ -2038,6 +2046,7 @@ void CRadialContext::LoadInternal()
 			auto iconScale = radialData.value("IconScale", 1.0f);
 			auto hoverTimeout = radialData.value("HoverTimeout", 0);
 			auto itemRotation = radialData.value("ItemRotation", 0);
+			auto arcSpanDegrees = radialData.value("ArcSpanDegrees", 360);
 			auto showTooltip = radialData.value("ShowItemNameTooltip", false);
 			auto centerItemName = radialData.value("CenterItemName", "");
 
@@ -2059,6 +2068,7 @@ void CRadialContext::LoadInternal()
 			radial->IconScale = iconScale;
 			radial->HoverTimeout = hoverTimeout;
 			radial->ItemRotationDegrees = itemRotation;
+			radial->ArcSpanDegrees = arcSpanDegrees;
 			radial->ShowItemNameTooltip = showTooltip;
 			radial->SpecificCenterItemName = centerItemName;
 
