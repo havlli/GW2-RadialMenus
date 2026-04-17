@@ -101,15 +101,44 @@ License: MIT. Any file where we lift substantial logic must carry Friendly0Fire'
 
 Note on angular math: the per-slice `cos/sin` placement in GW2Radial lives in `shaders/WheelElement.hlsl` (GPU side). The C++ side only passes `elementCount` / `centerScale` to a constant buffer. Our port re-implements placement in C++ using the same polar formula — the existing `RadialMenu::Render` at [RadialMenu.cpp:317-321](src/Core/RadialMenu.cpp#L317-L321) already does this; we extend it.
 
-### Feature 1 — Icon size + angular spread
+### Feature 1 — Icon size + angular spread — SCRATCHED (see Lesson)
+
 - `include/Wheel.h:237-243` — option members: `scaleOption_` (default 1.0, slider `[0.25, 4.0]`), `centerScaleOption_` (0.2, `[0.05, 0.5]`), `opacityMultiplierOption_` (100, `[0, 100]`), `animationTimeOption_` (750 ms, `[0, 2000]`), `animationScale_` (1.0, `[0, 1]`).
 - `src/Wheel.cpp:41-63` — option ctor defaults.
 - `src/Wheel.cpp:201-214` — UI sliders.
 - `src/Wheel.cpp:576-580` — `baseSpriteDimensions = scale * 0.5` in normalized space, aspect-corrected.
 - `src/Wheel.cpp:122-153` (`UpdateHover`) — sole angular hit-test math in C++: `mouseAngle = atan2(-y, -x) - π/2`, `elementAngle = 2π / N`, `elementId = int((mouseAngle - elementAngle/2) / elementAngle + 1) % N`. Aspect correction multiplies `mousePos.y` by `screenH/screenW`. Central deadzone radius: `scale * 0.125 * 0.8 * centerScale`.
 - Our equivalent: [RadialMenu.cpp:317-321](src/Core/RadialMenu.cpp#L317-L321) and [RadialMenu.cpp:1008-1036](src/Core/RadialMenu.cpp#L1008-L1036).
-- **Port shape:** we already have `IconScale` ([RadialMenu.h:37](src/Core/RadialMenu.h#L37)) and a scale slider. Adding an "Angular spread" (multiplier on `SegmentRadius`) and explicit icon-size slider is a ~30-line change.
 - **Related issues:** GW2Radial#287 "Jiggly wheel" (motion sickness, hover-wobble animation with no off-switch) — cautionary tale: every new animation needs an opt-out. GW2Radial#73, #63 (animation time slider).
+
+**Lesson learned (attempted 2026-04-18, reverted):**
+Shipped an `ArcSpanDegrees` slider (60–360, default 360) and verified it via CI +
+in-game. Behavior was mathematically correct but visually broken: the segment
+background textures (`TEX_MW_*_BASE`, `TEX_MW_*_SELECTORn`) are **pre-rendered at
+fixed 360°/N layouts**. Changing `SegmentRadius` rotates icons and selector
+highlights out of sync with the base — the wheel looks mismatched.
+
+Same trap applies to the alternate interpretation (per-item radial distance via
+`SegmentContentDistance` multiplier): icons would move but the base texture's
+outer ring stays put, producing either empty rims or icons punched through the
+outer edge. User wanted a "leaner" wheel — smaller backdrop with a larger icon
+orbit — which the pre-rendered art can't express.
+
+**Implications for future work:**
+- Anything that changes wheel geometry (spread, radius, asymmetric layout) needs
+  either (a) new backdrop art at the new aspect, or (b) switching from
+  `ImGui::Image(TEX_MW_*)` to procedural `ImDrawList::AddCircleFilled` /
+  `AddCircleFilled` + `AddLine` segmenting. (b) is the GW2Radial "replace
+  renderer with ImGui" direction the kickoff prompt already hints at — but it's
+  a much larger project than a per-feature port.
+- The existing `Scale` and `IconScale` sliders already cover the obvious
+  "bigger/smaller" user need; they scale both backdrop and icons coherently.
+- Feature 1 as originally scoped ("pure parameters feeding cos/sin math") is a
+  trap: the cos/sin math is not actually pure because it shares a frame of
+  reference with the pre-rendered sprites.
+- Do not retry without first committing to procedural backdrop rendering. File
+  an upstream issue asking DeltaGW2 whether procedural rendering is on the
+  roadmap before doing the work.
 
 ### Feature 2 — Cursor-warp-to-center reticule (Draw in Center)
 - `include/Wheel.h:213` — `centralKeybind_` (separate "Show in Center" bind).
