@@ -12,12 +12,19 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <ctime>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "imgui/imgui.h"
+
+#include "nlohmann/json.hpp"
+using json = nlohmann::json;
 
 #include "RTAPI/RTAPI.hpp"
 
@@ -27,12 +34,22 @@
 namespace
 {
 	constexpr size_t LOG_CAPACITY = 256;
+	constexpr size_t RECORDING_CAPACITY = 6000;     // ~5 min @ 20 Hz
+	constexpr unsigned RECORDING_INTERVAL_MS = 50;  // 20 Hz
+	constexpr size_t SNAPSHOT_SCHEMA_VERSION = 1;
 
 	struct LogEntry
 	{
 		unsigned long long TimestampMs; // since Init
 		std::string        Category;
 		std::string        Message;
+	};
+
+	struct StoredSnapshot
+	{
+		unsigned long long TimestampMs;
+		std::string        Label;
+		std::string        Json;       // pre-serialised so it can be dumped back fast
 	};
 
 	HWND g_RegisteredHwnd = nullptr;
@@ -56,6 +73,18 @@ namespace
 	std::deque<LogEntry>                        g_Log;
 
 	bool g_Paused = false;
+
+	/* captured snapshots list (manual) */
+	std::mutex                                  g_SnapshotsMutex;
+	std::vector<StoredSnapshot>                 g_Snapshots;
+	std::string                                 g_LastExportPath;
+
+	/* recording (continuous sampling at RECORDING_INTERVAL_MS) */
+	std::atomic<bool>                           g_RecordingOn{ false };
+	std::mutex                                  g_RecordingMutex;
+	std::deque<json>                            g_RecordingSamples;
+	unsigned long long                          g_LastSampleMs = 0;
+	std::string                                 g_LastRecordingPath;
 
 	unsigned long long NowMs()
 	{
@@ -265,6 +294,319 @@ namespace
 		{ EGameBinds_MiscInteract,            "MiscInteract" },
 		{ EGameBinds_MoveDodge,               "MoveDodge" },
 	};
+
+	/* ---------------- snapshot builders ---------------- */
+
+	/* Heuristic: guess the state from live metrics so users don't have to
+	   label every snapshot. Covers the combinations that matter for the
+	   current AC debugging. Ambiguous cases get flagged. */
+	std::string InferState()
+	{
+		CURSORINFO ci{};
+		ci.cbSize = sizeof(ci);
+		bool cursorOk = GetCursorInfo(&ci) == TRUE;
+		bool hidden = cursorOk && !(ci.flags & CURSOR_SHOWING);
+
+		RECT clip{};
+		bool clipPinned = false;
+		if (GetClipCursor(&clip))
+		{
+			LONG cw = clip.right - clip.left;
+			LONG ch = clip.bottom - clip.top;
+			clipPinned = (cw <= 2 && ch <= 2);
+		}
+
+		bool rtapiAC = RTAPIData ? (bool)RTAPIData->IsActionCamera : false;
+		bool rtapiPresent = (RTAPIData != nullptr);
+
+		std::string s;
+		if (hidden && (rtapiAC || !rtapiPresent)) { s = "cursor-hidden (likely Action-Cam or RMB-pan)"; }
+		else if (hidden)                          { s = "cursor-hidden, RTAPI says NOT AC (likely right-click pan)"; }
+		else                                       { s = "cursor-visible (normal)"; }
+
+		if (clipPinned) { s += " + ClipCursor=1x1 (Nexus MouseResetFix active)"; }
+		if (rtapiPresent && rtapiAC && !hidden) { s += " [ANOMALY: RTAPI says AC but cursor is visible]"; }
+		if (rtapiPresent && !rtapiAC && hidden) { s += " [RTAPI disagrees: not AC]"; }
+
+		return s;
+	}
+
+	json BuildSnapshotJson(const std::string& aLabel)
+	{
+		json j;
+		j["schemaVersion"] = SNAPSHOT_SCHEMA_VERSION;
+		j["capturedAtMs"] = NowMs();
+		j["label"] = aLabel;
+		j["inferredState"] = InferState();
+
+		/* cursor */
+		CURSORINFO ci{};
+		ci.cbSize = sizeof(ci);
+		BOOL ciOk = GetCursorInfo(&ci);
+		j["cursor"]["getCursorInfo"]["ok"] = (bool)ciOk;
+		if (ciOk)
+		{
+			j["cursor"]["getCursorInfo"]["flags"] = (unsigned)ci.flags;
+			j["cursor"]["getCursorInfo"]["cursorShowing"]    = (bool)(ci.flags & CURSOR_SHOWING);
+			j["cursor"]["getCursorInfo"]["cursorSuppressed"] = (bool)(ci.flags & CURSOR_SUPPRESSED);
+			j["cursor"]["getCursorInfo"]["ptScreenPos"]      = { {"x", ci.ptScreenPos.x}, {"y", ci.ptScreenPos.y} };
+			j["cursor"]["isCursorHidden"] = !(ci.flags & CURSOR_SHOWING);
+		}
+		POINT p{};
+		BOOL pOk = GetCursorPos(&p);
+		j["cursor"]["getCursorPos"] = { {"ok", (bool)pOk}, {"x", p.x}, {"y", p.y} };
+		ImVec2 ip = ImGui::GetMousePos();
+		j["cursor"]["imguiMousePos"] = { {"x", ip.x}, {"y", ip.y} };
+		RECT clip{};
+		BOOL gcOk = GetClipCursor(&clip);
+		if (gcOk)
+		{
+			LONG cw = clip.right - clip.left;
+			LONG ch = clip.bottom - clip.top;
+			j["cursor"]["clipRect"] = {
+				{"left", clip.left}, {"top", clip.top}, {"right", clip.right}, {"bottom", clip.bottom},
+				{"w", cw}, {"h", ch}, {"pinned1x1", (cw <= 2 && ch <= 2)}
+			};
+		}
+
+		/* action cam */
+		j["actionCam"]["cameraActionModeBoundInNexus"] = (APIDefs != nullptr) && APIDefs->GameBinds.IsBound(EGameBinds_CameraActionMode);
+		j["actionCam"]["rtapiPresent"]                  = (RTAPIData != nullptr);
+		j["actionCam"]["rtapiIsActionCamera"]           = RTAPIData ? (bool)RTAPIData->IsActionCamera : false;
+
+		/* raw input */
+		unsigned long long last_raw = g_LastRawInputTimeMs.load();
+		j["rawInput"]["registered"]      = (g_RegisteredHwnd != nullptr);
+		j["rawInput"]["totalEvents"]     = g_RawInputCount.load();
+		j["rawInput"]["lastDelta"]       = { {"dx", g_LastRawDx.load()}, {"dy", g_LastRawDy.load()} };
+		j["rawInput"]["accumulated"]     = { {"x", g_RawAccumX.load()}, {"y", g_RawAccumY.load()} };
+		j["rawInput"]["lastEventMs"]     = last_raw;
+		j["rawInput"]["lastEventMsAgo"]  = (last_raw == 0) ? 0ULL : (NowMs() - last_raw);
+
+		/* gameBinds probe */
+		{
+			json binds = json::array();
+			for (const ProbeEntry& e : kProbeBinds)
+			{
+				binds.push_back({
+					{"label", e.Label},
+					{"id",    (int)e.Bind},
+					{"bound", APIDefs ? APIDefs->GameBinds.IsBound(e.Bind) : false}
+				});
+			}
+			j["gameBinds"] = std::move(binds);
+		}
+
+		/* wndproc counters */
+		{
+			json wc = json::object();
+			const std::lock_guard<std::mutex> lock(g_WndMutex);
+			for (const auto& [m, c] : g_WndCounts)
+			{
+				const char* name = MsgName(m);
+				std::string key = name ? name : ("0x" + std::to_string(m));
+				wc[key] = c;
+			}
+			j["wndProcCounts"] = std::move(wc);
+		}
+
+		/* mumble data */
+		if (MumbleLink)
+		{
+			const Mumble::Data& d = *MumbleLink;
+			const Mumble::Context& c = d.Context;
+			j["mumble"]["present"]                = true;
+			j["mumble"]["data"]["uiVersion"]      = d.UIVersion;
+			j["mumble"]["data"]["uiTick"]         = d.UITick;
+			j["mumble"]["data"]["avatarPosition"] = { d.AvatarPosition.X, d.AvatarPosition.Y, d.AvatarPosition.Z };
+			j["mumble"]["data"]["avatarFront"]    = { d.AvatarFront.X, d.AvatarFront.Y, d.AvatarFront.Z };
+			j["mumble"]["data"]["avatarTop"]      = { d.AvatarTop.X, d.AvatarTop.Y, d.AvatarTop.Z };
+			j["mumble"]["data"]["cameraPosition"] = { d.CameraPosition.X, d.CameraPosition.Y, d.CameraPosition.Z };
+			j["mumble"]["data"]["cameraFront"]    = { d.CameraFront.X, d.CameraFront.Y, d.CameraFront.Z };
+			j["mumble"]["data"]["cameraTop"]      = { d.CameraTop.X, d.CameraTop.Y, d.CameraTop.Z };
+			j["mumble"]["context"]["mapID"]                = c.MapID;
+			j["mumble"]["context"]["mapType"]              = MapTypeName(c.MapType);
+			j["mumble"]["context"]["mapTypeRaw"]           = (int)c.MapType;
+			j["mumble"]["context"]["shardID"]              = c.ShardID;
+			j["mumble"]["context"]["instanceID"]           = c.InstanceID;
+			j["mumble"]["context"]["buildID"]              = c.BuildID;
+			j["mumble"]["context"]["mountIndex"]           = MountIndexName(c.MountIndex);
+			j["mumble"]["context"]["mountIndexRaw"]        = (int)c.MountIndex;
+			j["mumble"]["context"]["processID"]            = c.ProcessID;
+			j["mumble"]["context"]["isMapOpen"]            = (bool)c.IsMapOpen;
+			j["mumble"]["context"]["isCompassTopRight"]    = (bool)c.IsCompassTopRight;
+			j["mumble"]["context"]["isCompassRotating"]    = (bool)c.IsCompassRotating;
+			j["mumble"]["context"]["isGameFocused"]        = (bool)c.IsGameFocused;
+			j["mumble"]["context"]["isCompetitive"]        = (bool)c.IsCompetitive;
+			j["mumble"]["context"]["isTextboxFocused"]     = (bool)c.IsTextboxFocused;
+			j["mumble"]["context"]["isInCombat"]           = (bool)c.IsInCombat;
+		}
+		else
+		{
+			j["mumble"]["present"] = false;
+		}
+
+		/* mumble identity */
+		if (MumbleIdentity)
+		{
+			const Mumble::Identity& id = *MumbleIdentity;
+			j["mumble"]["identity"]["present"]        = true;
+			j["mumble"]["identity"]["name"]           = id.Name;
+			j["mumble"]["identity"]["profession"]     = ProfessionName(id.Profession);
+			j["mumble"]["identity"]["specialization"] = id.Specialization;
+			j["mumble"]["identity"]["race"]           = RaceName(id.Race);
+			j["mumble"]["identity"]["mapID"]          = id.MapID;
+			j["mumble"]["identity"]["worldID"]        = id.WorldID;
+			j["mumble"]["identity"]["teamColorID"]    = id.TeamColorID;
+			j["mumble"]["identity"]["isCommander"]    = id.IsCommander;
+			j["mumble"]["identity"]["fov"]            = id.FOV;
+			j["mumble"]["identity"]["uiSize"]         = (int)id.UISize;
+		}
+		else
+		{
+			j["mumble"]["identity"]["present"] = false;
+		}
+
+		/* nexusLink */
+		if (NexusLink)
+		{
+			j["nexusLink"]["present"]        = true;
+			j["nexusLink"]["width"]          = NexusLink->Width;
+			j["nexusLink"]["height"]         = NexusLink->Height;
+			j["nexusLink"]["scaling"]        = NexusLink->Scaling;
+			j["nexusLink"]["isMoving"]       = NexusLink->IsMoving;
+			j["nexusLink"]["isCameraMoving"] = NexusLink->IsCameraMoving;
+			j["nexusLink"]["isGameplay"]     = NexusLink->IsGameplay;
+		}
+		else
+		{
+			j["nexusLink"]["present"] = false;
+		}
+
+		/* rtapi */
+		if (RTAPIData)
+		{
+			const RTAPI::RealTimeData& r = *RTAPIData;
+			j["rtapi"]["present"]          = true;
+			j["rtapi"]["gameBuild"]        = r.GameBuild;
+			j["rtapi"]["gameState"]        = RtapiGameStateName(r.GameState);
+			j["rtapi"]["language"]         = RtapiLanguageName(r.Language);
+			j["rtapi"]["timeOfDay"]        = RtapiTimeOfDayName(r.TimeOfDay);
+			j["rtapi"]["mapID"]            = r.MapID;
+			j["rtapi"]["mapTypeRaw"]       = (unsigned)r.MapType;
+			j["rtapi"]["groupType"]        = RtapiGroupTypeName(r.GroupType);
+			j["rtapi"]["groupMemberCount"] = r.GroupMemberCount;
+			j["rtapi"]["accountName"]      = r.AccountName;
+			j["rtapi"]["characterName"]    = r.CharacterName;
+			j["rtapi"]["characterPosition"] = { r.CharacterPosition[0], r.CharacterPosition[1], r.CharacterPosition[2] };
+			j["rtapi"]["characterFacing"]   = { r.CharacterFacing[0], r.CharacterFacing[1], r.CharacterFacing[2] };
+			j["rtapi"]["profession"]          = r.Profession;
+			j["rtapi"]["eliteSpecialization"] = r.EliteSpecialization;
+			j["rtapi"]["mountIndex"]          = r.MountIndex;
+			unsigned cs = (unsigned)r.CharacterState;
+			j["rtapi"]["characterState"]["raw"]          = cs;
+			j["rtapi"]["characterState"]["isAlive"]      = (bool)(cs & (unsigned)RTAPI::ECharacterState::IsAlive);
+			j["rtapi"]["characterState"]["isDowned"]     = (bool)(cs & (unsigned)RTAPI::ECharacterState::IsDowned);
+			j["rtapi"]["characterState"]["isInCombat"]   = (bool)(cs & (unsigned)RTAPI::ECharacterState::IsInCombat);
+			j["rtapi"]["characterState"]["isSwimming"]   = (bool)(cs & (unsigned)RTAPI::ECharacterState::IsSwimming);
+			j["rtapi"]["characterState"]["isUnderwater"] = (bool)(cs & (unsigned)RTAPI::ECharacterState::IsUnderwater);
+			j["rtapi"]["characterState"]["isGliding"]    = (bool)(cs & (unsigned)RTAPI::ECharacterState::IsGliding);
+			j["rtapi"]["characterState"]["isFlying"]     = (bool)(cs & (unsigned)RTAPI::ECharacterState::IsFlying);
+			j["rtapi"]["cameraPosition"] = { r.CameraPosition[0], r.CameraPosition[1], r.CameraPosition[2] };
+			j["rtapi"]["cameraFacing"]   = { r.CameraFacing[0], r.CameraFacing[1], r.CameraFacing[2] };
+			j["rtapi"]["cameraFOV"]      = r.CameraFOV;
+			j["rtapi"]["isActionCamera"] = (bool)r.IsActionCamera;
+		}
+		else
+		{
+			j["rtapi"]["present"] = false;
+		}
+
+		/* events (rolling ring) */
+		{
+			json events = json::array();
+			const std::lock_guard<std::mutex> lock(g_LogMutex);
+			for (const LogEntry& e : g_Log)
+			{
+				events.push_back({
+					{"tMs",      e.TimestampMs},
+					{"category", e.Category},
+					{"message",  e.Message}
+				});
+			}
+			j["events"] = std::move(events);
+		}
+
+		return j;
+	}
+
+	/* Slim per-frame sample used for recording. Serialised to JSON to avoid
+	   drift against the snapshot format. */
+	json BuildSampleJson()
+	{
+		json s;
+		s["tMs"] = NowMs();
+
+		CURSORINFO ci{};
+		ci.cbSize = sizeof(ci);
+		bool hidden = false;
+		if (GetCursorInfo(&ci))
+		{
+			hidden = !(ci.flags & CURSOR_SHOWING);
+			s["hidden"] = hidden;
+			s["cursor"] = { ci.ptScreenPos.x, ci.ptScreenPos.y };
+		}
+		RECT clip{};
+		if (GetClipCursor(&clip))
+		{
+			LONG cw = clip.right - clip.left;
+			LONG ch = clip.bottom - clip.top;
+			s["clip1x1"] = (cw <= 2 && ch <= 2);
+		}
+		s["wmInput"]   = g_RawInputCount.load();
+		s["lastDelta"] = { g_LastRawDx.load(), g_LastRawDy.load() };
+		ImVec2 ip = ImGui::GetMousePos();
+		s["imguiMouse"] = { ip.x, ip.y };
+		if (RTAPIData)
+		{
+			s["rtapiAC"]     = (bool)RTAPIData->IsActionCamera;
+			s["rtapiCombat"] = (bool)((unsigned)RTAPIData->CharacterState & (unsigned)RTAPI::ECharacterState::IsInCombat);
+		}
+		if (MumbleLink)
+		{
+			s["combat"]   = (bool)MumbleLink->Context.IsInCombat;
+			s["mountIdx"] = (int)MumbleLink->Context.MountIndex;
+			s["mapID"]    = MumbleLink->Context.MapID;
+		}
+		if (NexusLink)
+		{
+			s["nexusCamMoving"] = NexusLink->IsCameraMoving;
+			s["nexusIsGameplay"] = NexusLink->IsGameplay;
+		}
+		return s;
+	}
+
+	std::string BuildFilename(const char* aPrefix)
+	{
+		time_t now = time(nullptr);
+		struct tm tm{};
+		localtime_s(&tm, &now);
+		char buf[64];
+		strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tm);
+		std::string out = aPrefix;
+		out.append("-");
+		out.append(buf);
+		out.append(".json");
+		return out;
+	}
+
+	std::filesystem::path SnapshotDir()
+	{
+		std::filesystem::path dir = AddonDirectory / "debug";
+		std::error_code ec;
+		std::filesystem::create_directories(dir, ec);
+		return dir;
+	}
 }
 
 namespace Debug
@@ -374,6 +716,20 @@ namespace Debug
 		Log("Release", "'%s' mode=%d hoverIndex=%d", aRadialName.c_str(), aSelectionMode, aHoverIndex);
 	}
 
+	void Tick()
+	{
+		if (!g_RecordingOn.load()) { return; }
+
+		unsigned long long now = NowMs();
+		if (now - g_LastSampleMs < RECORDING_INTERVAL_MS) { return; }
+		g_LastSampleMs = now;
+
+		json s = BuildSampleJson();
+		const std::lock_guard<std::mutex> lock(g_RecordingMutex);
+		g_RecordingSamples.push_back(std::move(s));
+		while (g_RecordingSamples.size() > RECORDING_CAPACITY) { g_RecordingSamples.pop_front(); }
+	}
+
 	void RenderPanel()
 	{
 		/* ---------------- header row ---------------- */
@@ -385,7 +741,7 @@ namespace Debug
 			g_Paused = !g_Paused;
 		}
 		ImGui::SameLine();
-		if (ImGui::SmallButton("Clear log"))
+		if (ImGui::SmallButton("Clear log##eventlog"))
 		{
 			const std::lock_guard<std::mutex> lock(g_LogMutex);
 			g_Log.clear();
@@ -409,6 +765,233 @@ namespace Debug
 				}
 			}
 			ImGui::SetClipboardText(out.c_str());
+		}
+
+		ImGui::Separator();
+
+		/* ---------------- snapshot + recording ---------------- */
+
+		if (ImGui::CollapsingHeader("Snapshot & Recording", ImGuiTreeNodeFlags_DefaultOpen))
+		{
+			ImGui::TextDisabled("Capture the full metric dump as JSON. Label each one so they're easy to tell apart when you paste them back.");
+
+			/* label input */
+			static char s_labelBuf[128] = "";
+			ImGui::SetNextItemWidth(300);
+			ImGui::InputTextWithHint("##snaplabel", "Label (e.g. 'AC off wheel closed')", s_labelBuf, sizeof(s_labelBuf));
+			ImGui::SameLine();
+			if (ImGui::Button("Add snapshot"))
+			{
+				std::string label = s_labelBuf[0] ? std::string(s_labelBuf) : std::string("(unlabelled)");
+				json j = BuildSnapshotJson(label);
+				StoredSnapshot ss;
+				ss.TimestampMs = NowMs();
+				ss.Label = label;
+				ss.Json = j.dump();
+				{
+					const std::lock_guard<std::mutex> lock(g_SnapshotsMutex);
+					g_Snapshots.push_back(std::move(ss));
+				}
+				Log("Snapshot", "captured '%s' (inferred: %s)", label.c_str(), j.value("inferredState", "?").c_str());
+				s_labelBuf[0] = '\0';
+			}
+
+			ImGui::SameLine();
+			size_t snapCount = 0;
+			{
+				const std::lock_guard<std::mutex> lock(g_SnapshotsMutex);
+				snapCount = g_Snapshots.size();
+			}
+			ImGui::Text("(%zu captured)", snapCount);
+
+			if (snapCount > 0)
+			{
+				if (ImGui::Button("Copy all as JSON##snapshots"))
+				{
+					json bundle;
+					bundle["schemaVersion"] = SNAPSHOT_SCHEMA_VERSION;
+					bundle["exportedAtMs"] = NowMs();
+					bundle["snapshots"] = json::array();
+					{
+						const std::lock_guard<std::mutex> lock(g_SnapshotsMutex);
+						for (const StoredSnapshot& s : g_Snapshots)
+						{
+							bundle["snapshots"].push_back(json::parse(s.Json, nullptr, false));
+						}
+					}
+					std::string out = bundle.dump(2);
+					ImGui::SetClipboardText(out.c_str());
+					Log("Snapshot", "copied bundle of %zu (%zu bytes) to clipboard", snapCount, out.size());
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Save all to file##snapshots"))
+				{
+					json bundle;
+					bundle["schemaVersion"] = SNAPSHOT_SCHEMA_VERSION;
+					bundle["exportedAtMs"] = NowMs();
+					bundle["snapshots"] = json::array();
+					{
+						const std::lock_guard<std::mutex> lock(g_SnapshotsMutex);
+						for (const StoredSnapshot& s : g_Snapshots)
+						{
+							bundle["snapshots"].push_back(json::parse(s.Json, nullptr, false));
+						}
+					}
+					std::filesystem::path path = SnapshotDir() / BuildFilename("snapshots");
+					std::ofstream f(path);
+					f << bundle.dump(2);
+					g_LastExportPath = path.string();
+					Log("Snapshot", "saved bundle to %s", g_LastExportPath.c_str());
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Clear all##snapshots"))
+				{
+					const std::lock_guard<std::mutex> lock(g_SnapshotsMutex);
+					g_Snapshots.clear();
+				}
+			}
+
+			if (!g_LastExportPath.empty())
+			{
+				ImGui::TextDisabled("Last saved to: %s", g_LastExportPath.c_str());
+			}
+
+			if (snapCount > 0)
+			{
+				if (ImGui::BeginTable("##snaptable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg))
+				{
+					ImGui::TableSetupColumn("#");
+					ImGui::TableSetupColumn("Time");
+					ImGui::TableSetupColumn("Label / inferred state");
+					ImGui::TableSetupColumn("");
+					ImGui::TableHeadersRow();
+
+					std::vector<StoredSnapshot> snap;
+					{
+						const std::lock_guard<std::mutex> lock(g_SnapshotsMutex);
+						snap = g_Snapshots;
+					}
+
+					int removeIdx = -1;
+					for (size_t i = 0; i < snap.size(); i++)
+					{
+						ImGui::TableNextRow();
+						ImGui::TableSetColumnIndex(0);
+						ImGui::Text("%zu", i + 1);
+						ImGui::TableSetColumnIndex(1);
+						ImGui::TextUnformatted(FormatHms(snap[i].TimestampMs).c_str());
+						ImGui::TableSetColumnIndex(2);
+						/* re-parse inferred state out of the stored json */
+						std::string inferred;
+						{
+							json j = json::parse(snap[i].Json, nullptr, false);
+							if (j.is_object() && j.contains("inferredState"))
+							{
+								inferred = j["inferredState"].get<std::string>();
+							}
+						}
+						ImGui::TextWrapped("%s  %s%s",
+							snap[i].Label.c_str(),
+							inferred.empty() ? "" : "— ",
+							inferred.c_str());
+						ImGui::TableSetColumnIndex(3);
+						std::string rmLabel = "remove##snap" + std::to_string(i);
+						if (ImGui::SmallButton(rmLabel.c_str()))
+						{
+							removeIdx = (int)i;
+						}
+					}
+					ImGui::EndTable();
+
+					if (removeIdx >= 0)
+					{
+						const std::lock_guard<std::mutex> lock(g_SnapshotsMutex);
+						if ((size_t)removeIdx < g_Snapshots.size())
+						{
+							g_Snapshots.erase(g_Snapshots.begin() + removeIdx);
+						}
+					}
+				}
+			}
+
+			ImGui::Separator();
+
+			/* ---------------- recording ---------------- */
+
+			bool recOn = g_RecordingOn.load();
+			if (ImGui::Checkbox("Record samples (20 Hz) while this box is checked", &recOn))
+			{
+				g_RecordingOn.store(recOn);
+				Log("Recording", recOn ? "started" : "stopped");
+			}
+
+			size_t sampleCount = 0;
+			{
+				const std::lock_guard<std::mutex> lock(g_RecordingMutex);
+				sampleCount = g_RecordingSamples.size();
+			}
+			ImGui::SameLine();
+			ImGui::Text("%zu samples", sampleCount);
+
+			ImGui::TextDisabled("Keeps the last %u samples (%.1f min @ 20 Hz). Rolling buffer.",
+				(unsigned)RECORDING_CAPACITY,
+				(RECORDING_CAPACITY * RECORDING_INTERVAL_MS) / 60000.0f);
+
+			if (sampleCount > 0)
+			{
+				if (ImGui::Button("Copy recording as JSON"))
+				{
+					json bundle;
+					bundle["schemaVersion"] = SNAPSHOT_SCHEMA_VERSION;
+					bundle["kind"] = "recording";
+					bundle["intervalMs"] = RECORDING_INTERVAL_MS;
+					bundle["exportedAtMs"] = NowMs();
+					bundle["samples"] = json::array();
+					{
+						const std::lock_guard<std::mutex> lock(g_RecordingMutex);
+						for (const json& s : g_RecordingSamples)
+						{
+							bundle["samples"].push_back(s);
+						}
+					}
+					std::string out = bundle.dump();
+					ImGui::SetClipboardText(out.c_str());
+					Log("Recording", "copied %zu samples (%zu bytes) to clipboard", sampleCount, out.size());
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Save recording to file"))
+				{
+					json bundle;
+					bundle["schemaVersion"] = SNAPSHOT_SCHEMA_VERSION;
+					bundle["kind"] = "recording";
+					bundle["intervalMs"] = RECORDING_INTERVAL_MS;
+					bundle["exportedAtMs"] = NowMs();
+					bundle["samples"] = json::array();
+					{
+						const std::lock_guard<std::mutex> lock(g_RecordingMutex);
+						for (const json& s : g_RecordingSamples)
+						{
+							bundle["samples"].push_back(s);
+						}
+					}
+					std::filesystem::path path = SnapshotDir() / BuildFilename("recording");
+					std::ofstream f(path);
+					f << bundle.dump();
+					g_LastRecordingPath = path.string();
+					Log("Recording", "saved %zu samples to %s", sampleCount, g_LastRecordingPath.c_str());
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Clear recording"))
+				{
+					const std::lock_guard<std::mutex> lock(g_RecordingMutex);
+					g_RecordingSamples.clear();
+				}
+			}
+
+			if (!g_LastRecordingPath.empty())
+			{
+				ImGui::TextDisabled("Last saved to: %s", g_LastRecordingPath.c_str());
+			}
 		}
 
 		ImGui::Separator();

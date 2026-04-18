@@ -98,6 +98,7 @@ namespace Addon
 	void Render()
 	{
 		StateObserver::Advance();
+		Debug::Tick();
 		assert(RadialCtx);
 		RadialCtx->Render();
 	}

@@ -54,6 +54,13 @@ namespace Debug
 	void OnRadialReleased(const std::string& aRadialName, int aSelectionMode, int aHoverIndex);
 
 	///----------------------------------------------------------------------------------------------------
+	/// Tick:
+	/// 	Called once per frame from Addon::Render. Drives recording sampling
+	/// 	(rate-limited). Cheap when recording is off.
+	///----------------------------------------------------------------------------------------------------
+	void Tick();
+
+	///----------------------------------------------------------------------------------------------------
 	/// RenderPanel:
 	/// 	Renders the full debug panel. Expected to be called inside an active
 	/// 	ImGui window/tab. Uses CollapsingHeaders so sections can be toggled.
