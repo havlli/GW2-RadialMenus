@@ -32,6 +32,7 @@ class CRadialMenu
 	public:
 	bool                        DrawInCenter;
 	bool                        DoNotCenterCursor;
+	bool                        ShowCenterReticule  = false;
 	bool                        RestoreCursor;
 	float                       Scale;
 	float                       IconScale = 1.0f;

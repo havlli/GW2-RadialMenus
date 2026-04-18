@@ -1216,6 +1216,11 @@ void CRadialContext::RenderEditorTab()
 				ImGui::BeginGroup();
 				ImGui::Indent();
 				ImGui::Checkbox("Do not set cursor to center on activation", &this->EditingMenu->DoNotCenterCursor);
+				if (ImGui::Checkbox("Show center reticule", &this->EditingMenu->ShowCenterReticule))
+				{
+					HasChanges = true;
+				}
+				ImGui::HelpMarker("Draws a small crosshair at the wheel's center while the menu is open.\nHelps you see where the cursor was warped (or where the wheel's pivot is, if cursor warping is off) so quick taps don't mis-select an item.");
 				ImGui::EndGroup();
 			}
 			ImGui::Checkbox("Restore Cursor Position", &this->EditingMenu->RestoreCursor);
@@ -2033,6 +2038,7 @@ void CRadialContext::LoadInternal()
 
 			auto drawInCenter = radialData.value("DrawInCenter", false);
 			auto doNotCenterCursor = radialData.value("DoNotCenterCursor", false);
+			auto showCenterReticule = radialData.value("ShowCenterReticule", false);
 			auto restoreCursor = radialData.value("RestoreCursor", false);
 			auto scale = radialData.value("Scale", 1.0f);
 			auto iconScale = radialData.value("IconScale", 1.0f);
@@ -2054,6 +2060,7 @@ void CRadialContext::LoadInternal()
 			radial->SetCenterBehavior(centerBehavior);
 			radial->DrawInCenter = drawInCenter;
 			radial->DoNotCenterCursor = doNotCenterCursor;
+			radial->ShowCenterReticule = showCenterReticule;
 			radial->RestoreCursor = restoreCursor;
 			radial->Scale = scale;
 			radial->IconScale = iconScale;

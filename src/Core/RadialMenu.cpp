@@ -95,6 +95,7 @@ void CRadialMenu::Save()
 
 		{"DrawInCenter", this->DrawInCenter},
 		{"DoNotCenterCursor", this->DoNotCenterCursor},
+		{"ShowCenterReticule", this->ShowCenterReticule},
 		{"RestoreCursor", this->RestoreCursor},
 		{"Scale", this->Scale},
 		{"IconScale", this->IconScale},
@@ -291,7 +292,28 @@ bool CRadialMenu::Render()
 
 		float contentSize = this->SegmentContentSize.x * this->IconScale * NexusLink->Scaling;
 		float contentSizeHover = contentSize * 1.1f;
-		
+
+		/* ported from GW2Radial: center reticule for Draw-in-Center (helps users see
+		   where the cursor was warped, and preempts GW2Radial#267-class bugs where
+		   a quick tap before the fade completes selects the wrong item). */
+		if (this->DrawInCenter && this->ShowCenterReticule)
+		{
+			ImDrawList* dl = ImGui::GetWindowDrawList();
+			float s = NexusLink->Scaling;
+			float alpha = 0.7f * this->RenderOpacity;
+			ImU32 col = ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, alpha));
+			float r = 6.0f * s;
+			float gap = 3.0f * s;
+			float arm = 10.0f * s;
+			float thick = 1.5f * s;
+			ImVec2 c = this->Origin;
+			dl->AddCircle(c, r, col, 24, thick);
+			dl->AddLine(ImVec2(c.x - r - gap - arm, c.y), ImVec2(c.x - r - gap, c.y), col, thick);
+			dl->AddLine(ImVec2(c.x + r + gap, c.y), ImVec2(c.x + r + gap + arm, c.y), col, thick);
+			dl->AddLine(ImVec2(c.x, c.y - r - gap - arm), ImVec2(c.x, c.y - r - gap), col, thick);
+			dl->AddLine(ImVec2(c.x, c.y + r + gap), ImVec2(c.x, c.y + r + gap + arm), col, thick);
+		}
+
 		if (this->SegmentTexture)
 		{
 			/* draw segment backgrounds */
