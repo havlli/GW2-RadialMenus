@@ -78,6 +78,7 @@ namespace Addon
 		APIDefs->WndProc.Register(Addon::WndProc);
 
 		Debug::Init(nullptr); /* raw-input registration deferred until first WndProc sees HWND */
+		Debug::RegisterKeybinds();
 	}
 
 	void Unload()
@@ -90,6 +91,7 @@ namespace Addon
 		APIDefs->Renderer.Deregister(Addon::RenderOptions);
 		APIDefs->WndProc.Deregister(Addon::WndProc);
 
+		Debug::DeregisterKeybinds();
 		Debug::Shutdown();
 
 		delete RadialCtx;

@@ -74,6 +74,9 @@ namespace
 
 	bool g_Paused = false;
 
+	/* shared label buffer (used by both snapshots and the next recording start) */
+	char                                        g_LabelBuf[128] = { 0 };
+
 	/* captured snapshots list (manual) */
 	std::mutex                                  g_SnapshotsMutex;
 	std::vector<StoredSnapshot>                 g_Snapshots;
@@ -84,7 +87,14 @@ namespace
 	std::mutex                                  g_RecordingMutex;
 	std::deque<json>                            g_RecordingSamples;
 	unsigned long long                          g_LastSampleMs = 0;
+	unsigned long long                          g_RecordingStartedMs = 0;
+	std::string                                 g_RecordingLabel;
 	std::string                                 g_LastRecordingPath;
+
+	/* keybinds */
+	bool                                        g_KeybindsRegistered = false;
+	constexpr const char* KB_DEBUG_SNAPSHOT            = "KB_DEBUG_SNAPSHOT";
+	constexpr const char* KB_DEBUG_TOGGLE_RECORDING    = "KB_DEBUG_TOGGLE_RECORDING";
 
 	unsigned long long NowMs()
 	{
@@ -716,6 +726,81 @@ namespace Debug
 		Log("Release", "'%s' mode=%d hoverIndex=%d", aRadialName.c_str(), aSelectionMode, aHoverIndex);
 	}
 
+	/* Shared capture path used by both the button and the keybind handler. */
+	static void CaptureSnapshotWithLabel(const std::string& aLabel)
+	{
+		json j = BuildSnapshotJson(aLabel);
+		StoredSnapshot ss;
+		ss.TimestampMs = NowMs();
+		ss.Label = aLabel;
+		ss.Json = j.dump();
+		{
+			const std::lock_guard<std::mutex> lock(g_SnapshotsMutex);
+			g_Snapshots.push_back(std::move(ss));
+		}
+		std::string inferred = j.value("inferredState", std::string("?"));
+		Log("Snapshot", "captured '%s' (inferred: %s)", aLabel.c_str(), inferred.c_str());
+	}
+
+	/* Shared recording toggle used by both the checkbox and the keybind handler. */
+	static void ToggleRecording()
+	{
+		bool nowOn = !g_RecordingOn.load();
+		g_RecordingOn.store(nowOn);
+		if (nowOn)
+		{
+			g_RecordingStartedMs = NowMs();
+			g_RecordingLabel = g_LabelBuf[0] ? std::string(g_LabelBuf) : std::string("(unlabelled)");
+			Log("Recording", "started (label='%s')", g_RecordingLabel.c_str());
+		}
+		else
+		{
+			Log("Recording", "stopped (%zu samples since start)",
+				[]() -> size_t { const std::lock_guard<std::mutex> lock(g_RecordingMutex); return g_RecordingSamples.size(); }());
+		}
+	}
+
+	/* Nexus keybind handler. Trivial dispatch — our two binds only fire on press. */
+	static void OnDebugKeybind(const char* aIdentifier, bool aIsRelease)
+	{
+		if (aIsRelease) { return; }
+		if (aIdentifier == nullptr) { return; }
+
+		if (std::string(aIdentifier) == KB_DEBUG_SNAPSHOT)
+		{
+			std::string label = g_LabelBuf[0] ? std::string(g_LabelBuf) : std::string("(unlabelled)");
+			CaptureSnapshotWithLabel(label);
+			return;
+		}
+		if (std::string(aIdentifier) == KB_DEBUG_TOGGLE_RECORDING)
+		{
+			ToggleRecording();
+			return;
+		}
+	}
+
+	void RegisterKeybinds()
+	{
+		if (g_KeybindsRegistered) { return; }
+		if (!APIDefs) { return; }
+		/* "(null)" = no default; user sets the key in Nexus keybinds. */
+		APIDefs->InputBinds.RegisterWithString(KB_DEBUG_SNAPSHOT, OnDebugKeybind, "(null)");
+		APIDefs->InputBinds.RegisterWithString(KB_DEBUG_TOGGLE_RECORDING, OnDebugKeybind, "(null)");
+		APIDefs->Localization.Set(KB_DEBUG_SNAPSHOT,         "en", "Debug: Snapshot");
+		APIDefs->Localization.Set(KB_DEBUG_TOGGLE_RECORDING, "en", "Debug: Toggle recording");
+		g_KeybindsRegistered = true;
+		Log("Debug", "keybinds registered (assign keys in Nexus -> Keybinds)");
+	}
+
+	void DeregisterKeybinds()
+	{
+		if (!g_KeybindsRegistered) { return; }
+		if (!APIDefs) { return; }
+		APIDefs->InputBinds.Deregister(KB_DEBUG_SNAPSHOT);
+		APIDefs->InputBinds.Deregister(KB_DEBUG_TOGGLE_RECORDING);
+		g_KeybindsRegistered = false;
+	}
+
 	void Tick()
 	{
 		if (!g_RecordingOn.load()) { return; }
@@ -775,26 +860,16 @@ namespace Debug
 		{
 			ImGui::TextDisabled("Capture the full metric dump as JSON. Label each one so they're easy to tell apart when you paste them back.");
 
-			/* label input */
-			static char s_labelBuf[128] = "";
+			/* label input (shared with recording-start and with the keybind handler) */
 			ImGui::SetNextItemWidth(300);
-			ImGui::InputTextWithHint("##snaplabel", "Label (e.g. 'AC off wheel closed')", s_labelBuf, sizeof(s_labelBuf));
+			ImGui::InputTextWithHint("##snaplabel", "Label (applies to snapshot OR next recording)", g_LabelBuf, sizeof(g_LabelBuf));
 			ImGui::SameLine();
 			if (ImGui::Button("Add snapshot"))
 			{
-				std::string label = s_labelBuf[0] ? std::string(s_labelBuf) : std::string("(unlabelled)");
-				json j = BuildSnapshotJson(label);
-				StoredSnapshot ss;
-				ss.TimestampMs = NowMs();
-				ss.Label = label;
-				ss.Json = j.dump();
-				{
-					const std::lock_guard<std::mutex> lock(g_SnapshotsMutex);
-					g_Snapshots.push_back(std::move(ss));
-				}
-				Log("Snapshot", "captured '%s' (inferred: %s)", label.c_str(), j.value("inferredState", "?").c_str());
-				s_labelBuf[0] = '\0';
+				std::string label = g_LabelBuf[0] ? std::string(g_LabelBuf) : std::string("(unlabelled)");
+				CaptureSnapshotWithLabel(label);
 			}
+			ImGui::TextDisabled("Hands-free capture: assign a key in Nexus -> Keybinds to 'Debug: Snapshot' (id=KB_DEBUG_SNAPSHOT). Required when cursor is locked (Action Cam on or wheel is open).");
 
 			ImGui::SameLine();
 			size_t snapCount = 0;
@@ -919,10 +994,10 @@ namespace Debug
 			/* ---------------- recording ---------------- */
 
 			bool recOn = g_RecordingOn.load();
+			bool recWas = recOn;
 			if (ImGui::Checkbox("Record samples (20 Hz) while this box is checked", &recOn))
 			{
-				g_RecordingOn.store(recOn);
-				Log("Recording", recOn ? "started" : "stopped");
+				if (recOn != recWas) { ToggleRecording(); /* captures g_LabelBuf on start */ }
 			}
 
 			size_t sampleCount = 0;
@@ -931,21 +1006,34 @@ namespace Debug
 				sampleCount = g_RecordingSamples.size();
 			}
 			ImGui::SameLine();
-			ImGui::Text("%zu samples", sampleCount);
+			if (g_RecordingOn.load())
+			{
+				ImGui::Text("%zu samples (labelled '%s')", sampleCount, g_RecordingLabel.c_str());
+			}
+			else if (sampleCount > 0)
+			{
+				ImGui::Text("%zu samples (last label '%s')", sampleCount, g_RecordingLabel.c_str());
+			}
+			else
+			{
+				ImGui::Text("%zu samples", sampleCount);
+			}
 
-			ImGui::TextDisabled("Keeps the last %u samples (%.1f min @ 20 Hz). Rolling buffer.",
+			ImGui::TextDisabled("Rolling buffer of last %u samples (%.1f min @ 20 Hz). Label is captured at Start; recording picks up 'Label' field above when toggled on.",
 				(unsigned)RECORDING_CAPACITY,
 				(RECORDING_CAPACITY * RECORDING_INTERVAL_MS) / 60000.0f);
+			ImGui::TextDisabled("Hands-free toggle: assign a key to 'Debug: Toggle recording' (id=KB_DEBUG_TOGGLE_RECORDING) in Nexus -> Keybinds.");
 
 			if (sampleCount > 0)
 			{
-				if (ImGui::Button("Copy recording as JSON"))
-				{
+				auto buildBundle = []() {
 					json bundle;
 					bundle["schemaVersion"] = SNAPSHOT_SCHEMA_VERSION;
 					bundle["kind"] = "recording";
-					bundle["intervalMs"] = RECORDING_INTERVAL_MS;
+					bundle["label"] = g_RecordingLabel;
+					bundle["startedAtMs"] = g_RecordingStartedMs;
 					bundle["exportedAtMs"] = NowMs();
+					bundle["intervalMs"] = RECORDING_INTERVAL_MS;
 					bundle["samples"] = json::array();
 					{
 						const std::lock_guard<std::mutex> lock(g_RecordingMutex);
@@ -954,6 +1042,12 @@ namespace Debug
 							bundle["samples"].push_back(s);
 						}
 					}
+					return bundle;
+				};
+
+				if (ImGui::Button("Copy recording as JSON"))
+				{
+					json bundle = buildBundle();
 					std::string out = bundle.dump();
 					ImGui::SetClipboardText(out.c_str());
 					Log("Recording", "copied %zu samples (%zu bytes) to clipboard", sampleCount, out.size());
@@ -961,20 +1055,17 @@ namespace Debug
 				ImGui::SameLine();
 				if (ImGui::Button("Save recording to file"))
 				{
-					json bundle;
-					bundle["schemaVersion"] = SNAPSHOT_SCHEMA_VERSION;
-					bundle["kind"] = "recording";
-					bundle["intervalMs"] = RECORDING_INTERVAL_MS;
-					bundle["exportedAtMs"] = NowMs();
-					bundle["samples"] = json::array();
+					json bundle = buildBundle();
+					/* slugify label for filename: alnum and dash only */
+					std::string slug;
+					for (char c : g_RecordingLabel)
 					{
-						const std::lock_guard<std::mutex> lock(g_RecordingMutex);
-						for (const json& s : g_RecordingSamples)
-						{
-							bundle["samples"].push_back(s);
-						}
+						if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) { slug.push_back(c); }
+						else if (c == ' ' || c == '-' || c == '_') { slug.push_back('-'); }
 					}
-					std::filesystem::path path = SnapshotDir() / BuildFilename("recording");
+					if (slug.empty()) { slug = "recording"; }
+					std::string prefix = "recording-" + slug;
+					std::filesystem::path path = SnapshotDir() / BuildFilename(prefix.c_str());
 					std::ofstream f(path);
 					f << bundle.dump();
 					g_LastRecordingPath = path.string();

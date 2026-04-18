@@ -39,6 +39,17 @@ namespace Debug
 	UINT OnWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 	///----------------------------------------------------------------------------------------------------
+	/// RegisterKeybinds / DeregisterKeybinds:
+	/// 	Registers Nexus input binds for hands-free capture. Required when
+	/// 	the cursor is locked (Action Cam on) or otherwise unreachable.
+	/// 	Binds exposed (user assigns keys in Nexus Options -> Keybinds):
+	/// 	  * KB_DEBUG_SNAPSHOT            - capture snapshot with current label
+	/// 	  * KB_DEBUG_TOGGLE_RECORDING    - toggle 20 Hz recording on/off
+	///----------------------------------------------------------------------------------------------------
+	void RegisterKeybinds();
+	void DeregisterKeybinds();
+
+	///----------------------------------------------------------------------------------------------------
 	/// Log:
 	/// 	Appends a printf-style entry to the rolling event log.
 	/// 	aCategory is a short tag (<= 16 chars recommended) shown as a prefix.
