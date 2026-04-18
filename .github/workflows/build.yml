@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Patch WMIC-free version.bat (workaround for WMIC removal on newer runner images)
+        shell: pwsh
+        run: |
+          @'
+          @echo off
+          powershell -NoProfile -Command "$n = Get-Date; $r = $n.Hour*60 + $n.Minute; @('#pragma once', (\"#define V_MAJOR {0}\" -f $n.Year), (\"#define V_MINOR {0}\" -f $n.Month), (\"#define V_BUILD {0}\" -f $n.Day), (\"#define V_REVISION {0}\" -f $r)) | Set-Content -Encoding ASCII src/Version.h"
+          '@ | Set-Content -Encoding ASCII Scripts/version.bat
+          Get-Content Scripts/version.bat
+
+      - name: Build x64 Release
+        run: msbuild GW2-RadialMenus.sln -p:Configuration=Release -p:Platform=x64 -m -v:minimal
+
+      - name: Resolve artifact name
+        id: meta
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $branch = "${{ github.ref_name }}" -replace '[^A-Za-z0-9._-]', '-'
+          "name=radials-$branch-$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload radials.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: x64/radials.dll
+          if-no-files-found: error
+          retention-days: 30
