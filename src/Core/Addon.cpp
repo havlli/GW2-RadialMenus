@@ -12,6 +12,7 @@
 
 #include "RTAPI/RTAPI.hpp"
 
+#include "Debug.h"
 #include "Language.h"
 #include "Shared.h"
 #include "StateObserver.h"
@@ -75,6 +76,8 @@ namespace Addon
 		APIDefs->Renderer.Register(ERenderType_Render, Addon::Render);
 		APIDefs->Renderer.Register(ERenderType_OptionsRender, Addon::RenderOptions);
 		APIDefs->WndProc.Register(Addon::WndProc);
+
+		Debug::Init(nullptr); /* raw-input registration deferred until first WndProc sees HWND */
 	}
 
 	void Unload()
@@ -86,6 +89,8 @@ namespace Addon
 		APIDefs->Renderer.Deregister(Addon::Render);
 		APIDefs->Renderer.Deregister(Addon::RenderOptions);
 		APIDefs->WndProc.Deregister(Addon::WndProc);
+
+		Debug::Shutdown();
 
 		delete RadialCtx;
 	}
@@ -131,6 +136,10 @@ namespace Addon
 	UINT WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 	{
 		WindowHandle = hWnd;
+
+		/* deferred one-shot: register for raw input the first time we have an HWND. */
+		Debug::Init(hWnd);
+		Debug::OnWndProc(hWnd, uMsg, wParam, lParam);
 
 		StateObserver::WndProc(hWnd, uMsg, wParam, lParam);
 		assert(RadialCtx);

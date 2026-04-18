@@ -15,6 +15,7 @@
 #include "nlohmann/json.hpp"
 using json = nlohmann::json;
 
+#include "Debug.h"
 #include "resource.h"
 #include "Util.h"
 #include "Shared.h"
@@ -397,6 +398,7 @@ bool CRadialMenu::Activate()
 	curInfo.cbSize = sizeof(CURSORINFO);
 	GetCursorInfo(&curInfo);
 	this->WasActionCamActive = !(curInfo.flags & CURSOR_SHOWING) && !(RadialCtx->IsLeftClickHeld || RadialCtx->IsRightClickHeld);
+	Debug::OnRadialActivateEvaluated(this->Identifier, this->WasActionCamActive, RadialCtx->IsLeftClickHeld, RadialCtx->IsRightClickHeld);
 	
 	/* override origin if draw in center */
 	if (this->DrawInCenter)
@@ -409,19 +411,21 @@ bool CRadialMenu::Activate()
 			/* winapi set cursor */
 			this->SetCursorPosition = GetCursorPosWR(this->Origin.x, this->Origin.y);
 			this->SetCursor = true;
+			Debug::OnCursorWarpIssued((int)this->Origin.x, (int)this->Origin.y, "DrawInCenter on activate");
 		}
 	}
 
 	if (this->WasActionCamActive)
 	{
 		std::thread([this]() {
-
+			Debug::OnActionCamToggleIssued(true /*opening*/);
 			this->API->GameBinds.Press(EGameBinds_CameraActionMode);
 			Sleep(10);
 			this->API->GameBinds.Release(EGameBinds_CameraActionMode);
 			Sleep(10); /* this delay is needed in order to set the cursor after action cam has been toggled */
 			this->SetCursorPosition = GetCursorPosWR(this->Origin.x, this->Origin.y);
 			this->SetCursor = true;
+			Debug::OnCursorWarpIssued((int)this->Origin.x, (int)this->Origin.y, "post-AC-off on activate");
 		}).detach();
 	}
 	
@@ -463,15 +467,19 @@ void CRadialMenu::Release(ESelectionMode aReason)
 	/* if is cancel, directly set it to -1 to not trigger any release */
 	int idx = aReason == ESelectionMode::Escape ? -1 : this->HoverIndex;
 
+	Debug::OnRadialReleased(this->Identifier, (int)aReason, idx);
+
 	/* winapi set cursor */
 	if (this->RestoreCursor && aReason != ESelectionMode::SingleItem)
 	{
 		this->SetCursorPosition = GetCursorPosWR(this->MousePos.x, this->MousePos.y);
 		this->SetCursor = true;
+		Debug::OnCursorWarpIssued((int)this->MousePos.x, (int)this->MousePos.y, "RestoreCursor on release");
 	}
 
 	if (this->WasActionCamActive && aReason != ESelectionMode::SingleItem)
 	{
+		Debug::OnActionCamToggleIssued(false /*closing*/);
 		this->API->GameBinds.InvokeAsync(EGameBinds_CameraActionMode, 10);
 	}
 

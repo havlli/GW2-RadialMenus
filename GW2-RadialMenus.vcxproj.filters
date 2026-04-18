@@ -120,6 +120,9 @@
     <ClInclude Include="src\Core\Conditions.h">
       <Filter>Core\Structs</Filter>
     </ClInclude>
+    <ClInclude Include="src\Core\Debug.h">
+      <Filter>Core</Filter>
+    </ClInclude>
     <ClInclude Include="src\Core\StateObserver.h">
       <Filter>Core</Filter>
     </ClInclude>
@@ -184,6 +187,9 @@
     </ClCompile>
     <ClCompile Include="src\Core\Conditions.cpp">
       <Filter>Core\Structs</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Core\Debug.cpp">
+      <Filter>Core</Filter>
     </ClCompile>
     <ClCompile Include="src\Core\ItemProcessor.cpp">
       <Filter>Core</Filter>

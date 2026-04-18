@@ -17,6 +17,7 @@
 using json = nlohmann::json;
 
 #include "Addon.h"
+#include "Debug.h"
 #include "Shared.h"
 #include "Util.h"
 #include "resource.h"
@@ -1911,6 +1912,9 @@ void CRadialContext::RenderOptions()
 
 		if (ImGui::BeginTabItem("Debug##radialmenus"))
 		{
+			Debug::RenderPanel();
+			ImGui::Separator();
+			ImGui::TextDisabled("--- StateObserver (derived conditions) ---");
 			StateObserver::RenderDebug();
 			ImGui::EndTabItem();
 		}
