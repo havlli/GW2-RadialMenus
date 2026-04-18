@@ -140,19 +140,72 @@ orbit — which the pre-rendered art can't express.
   an upstream issue asking DeltaGW2 whether procedural rendering is on the
   roadmap before doing the work.
 
-### Feature 2 — Cursor-warp-to-center reticule (Draw in Center)
+### Feature 2 — Cursor-warp-to-center / Action-Camera interaction — RESOLVED (see Outcome)
 - `include/Wheel.h:213` — `centralKeybind_` (separate "Show in Center" bind).
 - `src/Wheel.cpp:537-550` — `resetCursorPositionToCenter` lambda: `GetWindowRect` on the game HWND + `SetCursorPos` to `(screenW*0.5, screenH*0.5)`, then manually updates `ImGui::GetIO().MousePos`.
 - `src/Wheel.cpp:991-1033` (`ActivateWheel`) — on activate with `isMountOverlayLocked`: `currentPosition_ = (0.5, 0.5)`, `resetCursorPositionToCenter_ = true`, deferred to next draw so it lands **after** `displayDelayOption_`.
 - `src/Wheel.cpp:941-989` (`KeybindEvent`) — `center` param propagates from the bind callback into `ActivateWheel(center)`.
 - `src/Wheel.cpp:1093` — on deactivate, `cursorResetPosition_` captured at activation is used to warp back (gated by `resetCursorAfterKeybindOption_`).
-- **Upstream has already shipped the toggle.** Commit `6ddd529` ("Add option to not force cursor to center when drawing in center") introduced `DoNotCenterCursor` at [RadialMenu.h:34](src/Core/RadialMenu.h#L34) and the checkbox at [RadialContext.cpp:1218](src/Core/RadialContext.cpp#L1218). The remaining work from the kickoff prompt is the **in-menu reticule** drawing (a simple `ImDrawList::AddCircle` at `Origin`) and any tightening of the SetCursor timing relative to fade-in.
+- **Upstream has already shipped the toggle.** Commit `6ddd529` ("Add option to not force cursor to center when drawing in center") introduced `DoNotCenterCursor` at [RadialMenu.h:34](src/Core/RadialMenu.h#L34) and the checkbox at [RadialContext.cpp:1218](src/Core/RadialContext.cpp#L1218).
 - **Related issues:**
   - GW2-RadialMenus#7 (closed) — user's original complaint; the `DoNotCenterCursor` toggle was the fix.
-  - GW2Radial#269 / #247 (closed) — disabling "move cursor to original location" crashed the game until a late fix. **We must robust this path, not trust users' first `Release` invariants.**
-  - GW2Radial#267 (closed) — quick-tap-before-fade selects wrong mount. **Interacts with Feature 6.** Solution was a "Behavior when released before delay has lapsed" option.
-  - GW2Radial#236 (closed) + #344 (open) — Marker wheels require cursor to be warped back at release. Our Marker-style use cases (if any) need same.
-  - GW2Radial#294 (closed) — High-DPI scaling applied to overlay but not inputs. Since we use `NexusLink->Scaling` everywhere, we should be fine, but worth a sanity check.
+  - GW2-RadialMenus#3 (closed) — **the actual root cause of user's AC-wheel interaction issue.** Users must have `CameraActionMode` bound in Nexus → Game Keybinds for the addon's auto-toggle to work; otherwise `GameBinds.Press` is a no-op.
+  - GW2-RadialMenus#19 (open 2026-03-28) — "Preserve camera control through radial menus" — escalates to a "don't disturb AC at all" request. See Outcome below.
+  - GW2Radial#269 / #247 (closed) — disabling "move cursor to original location" crashed the game until a late fix.
+  - GW2Radial#267 (closed) — quick-tap-before-fade selects wrong mount. Interacts with Feature 6.
+  - GW2Radial#294 (closed) — High-DPI scaling applied to overlay but not inputs. Since we use `NexusLink->Scaling` everywhere, we should be fine.
+
+**Outcome (2026-04-18):**
+
+1. **In-menu reticule (small side-feature)** shipped on fork branch `feat/center-reticule`
+   as an opt-in checkbox `ShowCenterReticule`. Pure `ImDrawList::AddCircle/AddLine`
+   overlay at wheel center; defaults off. Not related to the user's actual AC
+   complaint — kept because it still prevents GW2Radial#267-class fast-tap
+   mis-selects for non-AC users. Upstream-PR candidate if desired.
+
+2. **The user's real AC-wheel interaction problem** ("wheel unusable while AC on")
+   was NOT a code bug. Root cause: `EGameBinds_CameraActionMode` was unbound in
+   Nexus → Options → Keybinds → Game tab, so the addon's existing auto-toggle
+   path at [RadialMenu.cpp:415-426](src/Core/RadialMenu.cpp#L415-L426) issued
+   `GameBinds.Press/Release(CameraActionMode)` to no effect. Same failure mode
+   as GW2-RadialMenus#3. **Fixed by user-side configuration; no code change.**
+
+3. **Debug subsystem built** on `debug/instrumentation` branch (fork-only, never
+   upstream) to verify this. Snapshots from the user's rig confirm:
+   - `GetCursorInfo().flags & CURSOR_SHOWING` is the correct AC detection signal.
+     Nobody in the ecosystem uses RTAPI's `IsActionCamera` bit (which isn't
+     populated unless the RTAPI addon is installed).
+   - The existing `Press → Sleep(10) → Release → Sleep(10) → SetCursorPos` dance
+     in `Activate()` works fine once the Nexus bind is set. No observed race with
+     Nexus `MouseResetFix` on this user's rig (ClipCursor pinned to game monitor,
+     not 1×1 as earlier research suggested — this may vary by Nexus version).
+   - **WM_INPUT raw deltas flow freely while cursor is hidden** (~940 events/sec
+     observed in a 7.5 sec AC-on segment). `GetCursorPos()` also updates live
+     behind the hidden cursor. `ImGui::GetMousePos()` is frozen while hidden.
+   - Therefore a "virtual cursor" `PreserveActionCamera` mode is technically
+     feasible: skip the AC toggle, hit-test against `GetCursorPos()` delta, draw
+     our own pointer sprite.
+
+4. **`PreserveActionCamera` mode dropped** — not shipped. Unavoidable UX
+   tradeoff: with AC left on, the same mouse movement that picks a wheel item
+   ALSO rotates the camera. User chose the cleaner workaround: sync in-game
+   AC-mode and normal-mode camera settings (FOV, distance, pitch) so the snap
+   on toggle is imperceptible. This removes the motivation for the feature.
+   If upstream issue #19 is ever revisited, the virtual-cursor design is
+   documented in this section's history for reference.
+
+**Do not retry `PreserveActionCamera` unless:**
+- ArenaNet exposes a per-context input routing API (allowing mouse-for-UI while
+  camera stays on), OR
+- The user's camera-setting parity approach proves insufficient in practice, OR
+- Upstream #19 gets maintainer attention and someone designs a cleaner UX.
+
+**Artifacts retained:**
+- `feat/center-reticule` branch — opt-in reticule.
+- `debug/instrumentation` branch — fork-internal diagnostics panel (Snapshot &
+  Recording with JSON export, Mumble/Nexus/RTAPI dumps, GameBinds probe,
+  WndProc counters, raw-input accumulator). Permanent tooling, used for all
+  future feature diagnosis.
 
 ### Feature 3 — Dismount-on-same-mount toggle
 - `src/MountWheel.cpp:114-144` (`MountWheel::BypassCheck`) — if `quickDismountOption_` is on and `MumbleLink::i().isMounted()`, set `we = previousUsed_` (or first usable) and **critically** set `kb = &dismountKeybind_` so the wheel skips opening and sends the in-game dismount bind directly (`Input::i().SendKeybind(bypassKeybind->keyCombo(), std::nullopt)`).
